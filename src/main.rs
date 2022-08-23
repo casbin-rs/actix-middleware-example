@@ -1,6 +1,14 @@
 #![allow(proc_macro_derive_resolution_fallback)]
+#![warn(unused_must_use)]
 
-use actix_web::{get, web, App, HttpServer, Responder};
+#[macro_use]
+extern crate log;
+#[macro_use]
+extern crate diesel_migrations;
+
+use actix_web::{get, web, Responder};
+use actix_web::{App, HttpServer};
+use std::env;
 
 mod api;
 mod config;
@@ -17,10 +25,32 @@ async fn greet(name: web::Path<String>) -> impl Responder {
     format!("This is {}!", name)
 }
 
-#[actix_web::main] // or #[tokio::main]
+#[actix_rt::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| App::new().service(greet))
-        .bind(("127.0.0.1", 8080))?
+    dotenv::dotenv().expect("Failed to read .env file, please add it");
+    std::env::set_var("RUST_LOG", "actix_web=debug");
+    env_logger::init();
+
+    let app_host = env::var("APP_HOST").expect("APP_HOST must be set.");
+    let app_port = env::var("APP_PORT").expect("APP_PORT must be set.");
+    let app_url = format!("{}:{}", &app_host, &app_port);
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool_size: u32 = std::env::var("POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+
+    let pool = config::db::migrate_and_config_db(&database_url, pool_size);
+
+    // setup middleware and actor service here
+
+    // add preset rules here
+
+    // host http server
+    HttpServer::new(move || App::new().app_data(pool.clone()))
+        .bind(&app_url)?
         .run()
-        .await
+        .await?;
+
+    Ok(())
 }
