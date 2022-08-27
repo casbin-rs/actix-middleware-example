@@ -2,9 +2,15 @@
 #![warn(unused_must_use)]
 
 #[macro_use]
+extern crate diesel;
+#[macro_use]
 extern crate log;
 #[macro_use]
 extern crate diesel_migrations;
+#[macro_use]
+extern crate serde_derive;
+#[macro_use]
+extern crate serde_json;
 
 use actix_web::{get, web, Responder};
 use actix_web::{App, HttpServer};
@@ -17,6 +23,7 @@ mod errors;
 mod middleware;
 mod models;
 mod routers;
+mod schema;
 mod services;
 mod utils;
 
