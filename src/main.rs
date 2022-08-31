@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #![allow(proc_macro_derive_resolution_fallback)]
-#![warn(unused_must_use)]
 
 #[macro_use]
 extern crate diesel;
@@ -26,8 +25,19 @@ extern crate serde_derive;
 #[macro_use]
 extern crate serde_json;
 
-use actix_web::{get, web, Responder};
+use crate::utils::csv_utils::{load_csv, walk_csv};
+use actix::Supervisor;
+use actix_casbin::casbin::{
+    function_map::key_match2, CachedEnforcer, CoreApi, DefaultModel, MgmtApi, Result,
+};
+use actix_casbin::CasbinActor;
+use actix_casbin_auth::CasbinService;
+use actix_cors::Cors;
+use actix_web::middleware::Logger;
+use actix_web::middleware::NormalizePath;
+use actix_web::middleware::TrailingSlash;
 use actix_web::{App, HttpServer};
+use diesel_adapter::DieselAdapter;
 use std::env;
 
 mod api;
@@ -41,13 +51,8 @@ mod schema;
 mod services;
 mod utils;
 
-#[get("/hello")]
-async fn greet(name: web::Path<String>) -> impl Responder {
-    format!("This is {}!", name)
-}
-
 #[actix_rt::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<()> {
     dotenv::dotenv().expect("Failed to read .env file, please add it");
     std::env::set_var("RUST_LOG", "actix_web=debug");
     env_logger::init();
@@ -63,15 +68,67 @@ async fn main() -> std::io::Result<()> {
 
     let pool = config::db::migrate_and_config_db(&database_url, pool_size);
 
-    // setup middleware and actor service here
+    let model = DefaultModel::from_file("casbin.conf").await?;
+    let adapter = DieselAdapter::new(database_url, pool_size)?;
+    let mut casbin_middleware = CasbinService::new(model, adapter).await.unwrap();
+    casbin_middleware
+        .write()
+        .await
+        .get_role_manager()
+        .write()
+        .matching_fn(Some(key_match2), None);
 
-    // add preset rules here
+    let share_enforcer = casbin_middleware.get_enforcer();
+    let clone_enforcer = share_enforcer.clone();
+    let casbin_actor = CasbinActor::<CachedEnforcer>::set_enforcer(share_enforcer)?;
+    let started_actor = Supervisor::start(|_| casbin_actor);
 
-    // host http server
-    HttpServer::new(move || App::new().app_data(pool.clone()))
-        .bind(&app_url)?
-        .run()
-        .await?;
+    let preset_rules = load_csv(walk_csv("."));
+    for mut policy in preset_rules {
+        let ptype = policy.remove(0);
+        if ptype.starts_with('p') {
+            match clone_enforcer.write().await.add_policy(policy).await {
+                Ok(_) => info!("Preset policies(p) add successfully"),
+                Err(err) => error!("Preset policies(p) add error: {}", err.to_string()),
+            };
+            continue;
+        } else if ptype.starts_with('g') {
+            match clone_enforcer
+                .write()
+                .await
+                .add_named_grouping_policy(&ptype, policy)
+                .await
+            {
+                Ok(_) => info!("Preset policies(p) add successfully"),
+                Err(err) => error!("Preset policies(g) add error: {}", err.to_string()),
+            };
+            continue;
+        } else {
+            unreachable!()
+        }
+    }
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(pool.clone())
+            .app_data(started_actor.clone())
+            .wrap(
+                Cors::default()
+                    .send_wildcard()
+                    .allowed_methods(vec!["GET", "POST", "DELETE"])
+                    .allowed_headers(vec![http::header::AUTHORIZATION, http::header::ACCEPT])
+                    .allowed_header(http::header::CONTENT_TYPE)
+                    .max_age(3600),
+            )
+            .wrap(NormalizePath::new(TrailingSlash::Trim))
+            .wrap(Logger::default())
+            .wrap(casbin_middleware.clone())
+            .wrap(crate::middleware::authn::Authentication)
+            .configure(routers::routes)
+    })
+    .bind(&app_url)?
+    .run()
+    .await?;
 
     Ok(())
 }
